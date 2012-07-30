@@ -1,0 +1,247 @@
+<?php
+
+class SocialTwitterUpdate extends WireData implements Module, ConfigurableModule {
+
+	/**
+	 * Basic information about module
+	 */
+	public static function getModuleInfo() {
+		return array(
+			'title' => 'Twitter Updater', 
+			'version' => 110, 
+			'summary' => 'Creates a tweet for a specified Twitter account when a page is published. If you have a bit.ly account, it is highly recommended to input your details in order to shorten URLs and leave more charcters available for the tweet. Please read the full instructions at the URL provided.',
+			'href' => 'http://processwire.com/talk/topic/837-socialtwitterupdate/',
+			'permanent' => false,
+			'singular' => true, 
+			'autoload' => true, 
+			);
+	}
+	
+	/**
+	 * Default configuration for module
+	 *
+	 */
+	static public function getDefaultData() {
+		return array(
+			'consumerKey' 			=> '',
+			'consumerSecret' 		=> '',
+			'oAuthToken' 			=> '',
+			'oAuthTokenSecret' 		=> '',
+			'bitlyLogin'			=> '',
+			'bitlyAPIKey'			=> '',
+			'tweetText'				=> ''
+		);
+	}
+
+	/**
+	 * Populate the default config data
+	 *
+	 */
+	public function __construct() {
+	   foreach(self::getDefaultData() as $key => $value) {
+		   $this->$key = $value;
+	   }
+	}
+	
+	public function ___render() {
+
+		if(!$inputfield = $this->getInputfield()) { 
+			$this->error("Not fully configured  / currently nonfunctional");
+			return $this->name;
+		}
+
+		return "\n<div class='" . $inputfield->className() . "'>" . $inputfield->render() . "\n</div>";
+	}
+	
+	static public function getModuleConfigInputfields(array $data) {
+
+		// this is a container for fields, basically like a fieldset
+		$fields = new InputfieldWrapper();
+
+		// since this is a static function, we can't use $this->modules, so get them from the global wire() function
+		$modules = wire('modules');
+
+		// Populate $data with the default config, because if they've never configured this module before,
+		// the $data provided to this function will be empty. Or, if you add new config items in a new version,
+		// $data won't have it until they configure it. Best bet is to merge defaults with custom, where
+		// custom overwrites the defaults (array_merge).
+		
+		$data = array_merge(self::getDefaultData(), $data);
+
+		// Populate the $fieldsModel with data for each checkbox
+		$fieldsModel = array(
+			'consumerKey' => array(
+					'label'=>"Consumer Key",
+					'desc'=>"",
+					'type'=>"_createInputfieldText"),
+			'consumerSecret' => array(
+					'label'=>"Consumer Secret",
+					'desc'=>"",
+					'type'=>"_createInputfieldText"),
+			'oAuthToken' => array(
+					'label'=>"OAuthToken",
+					'desc'=>"",
+					'type'=>"_createInputfieldText"),
+			'oAuthTokenSecret' => array(
+					'label'=>"OAuthTokenSecret",
+					'desc'=>"",
+					'type'=>"_createInputfieldText"),
+			'bitlyLogin' => array(
+					'label'=>"bit.ly Login",
+					'desc'=>"",
+					'type'=>"_createInputfieldText"),
+			'bitlyAPIKey' => array(
+					'label'=>"bit.ly API Key",
+					'desc'=>"",
+					'type'=>"_createInputfieldText"),
+			'tweetText' => array(
+					'label' => "Tweet Text",
+					'desc' => "The text of the tweet to display before your link. Please be careful as long links use up more characters!",
+					'type' => "_createInputfieldTextarea"),
+			'allowedPageParents' => array(
+					'label' => "Allowed Page Parents",
+					'desc' => "A comma-separate list of page parents whose children will create a tweet when saved.",
+					'type' => "_createInputfieldASMSelect"),
+			'allowedPagePhotoParents' => array(
+					'label' => "Allowed Page Parents (Photo Tweet)",
+					'desc' => "A comma-separate list of page parents whose children will create a tweet when saved. These pages will also upload an image to Twitter if there is an 'images' field in the template and there is at least one image uploaded to the page (it will use the first in the list), else it will fall back to a text-only tweet. Pages selected via this field will override any identical selections in the field above.",
+					'type' => "_createInputfieldASMSelect")
+		);
+		// Now use $data and $fieldsModel loop to create all the above fields
+		foreach ($fieldsModel as $f=>$fM){
+			$fields->add(
+				self::$fM['type']($f, $fM['label'], $data[$f], $fM['desc'])
+			);
+		}
+		return $fields;
+	}
+	
+	
+	public function init() {
+		$this->pages->addHookAfter('save', $this, 'postTweet'); 
+	}
+
+	public function postTweet(HookEvent $event) {
+		// Ensure we're only running this once or we could tweet about every page in this section! :)
+		if (!$runOnce) {
+			// Check to see if the current page's parent is in our allowed parent list
+			$page = $event->arguments[0];
+			
+			$tweetType = '';
+			
+			// Check if it's in the parent array for photos
+			if ($this->allowedPagePhotoParents && in_array($page->parent()->id,$this->allowedPagePhotoParents)) {
+				$tweetType = 'photo';
+			// Or else is it in the parent array for normal tweets
+			} elseif($this->allowedPageParents && in_array($page->parent()->id,$this->allowedPageParents)) {
+				$tweetType = 'text';
+			}
+			
+			// If it was in either array, continue
+			if (!empty($tweetType)) {
+				// Checks to see if we have the basic Twitter config options needed to continue
+				if ($this->consumerKey && $this->consumerSecret && $this->oAuthToken && $this->oAuthTokenSecret) {
+					
+					require_once 'tmhOAuth.php';
+					$tmhOAuth = new tmhOAuth(array(
+					  'consumer_key'    => $this->consumerKey,
+					  'consumer_secret' => $this->consumerSecret,
+					  'user_token'      => $this->oAuthToken,
+					  'user_secret'     => $this->oAuthTokenSecret
+					));
+					
+					// Set up our long URL before we try and shorten it with bit.ly
+					$tweetUrl = $page->httpUrl;
+					
+					// If we have correct bitly details, shorten the URL
+					if ($this->bitlyLogin && $this->bitlyAPIKey) {
+						require_once 'bitly.php';
+						$bitly = new Bitly($this->bitlyLogin, $this->bitlyAPIKey);
+						try {
+							$bitlyUrl = $bitly->shorten($tweetUrl);
+							}
+						catch (Exception $e) {
+							if ($e->getMessage()) {
+								$bitlyError = 'There was an error in your bit.ly details or you are attempting to shorten a non-web-accessible URL. The tweet will be posted using the long page URL instead.';
+							}
+						}
+						if (isset($bitlyUrl['url'])) {
+							$tweetUrl = $bitlyUrl['url'];
+						}
+					}
+					
+					$tweetStatus = trim($this->tweetText) . " " . $tweetUrl;
+					
+					if ($tweetType == 'photo' && $page->images) { // If the page's parent is in the photo upload list and we have an image, upload it
+						$tweetImage = $page->images->path . $page->images->first();
+						$code = $tmhOAuth->request(
+							'POST',
+						    'https://upload.twitter.com/1/statuses/update_with_media.json',
+						    array(
+							    'media[]'  => "@{$tweetImage};type=image/jpeg;filename={$image}",
+							    'status'   => $tweetStatus
+						    ),
+						    true, // use auth
+						    true  // multipart
+						);
+					} else {
+						$code = $tmhOAuth->request('POST', $tmhOAuth->url('1/statuses/update'), array(
+						  'status' => $tweetStatus
+						));
+					}
+				
+					if ($code == 200) {
+						$this->message('Your tweet was posted successfully.');
+						// We only care about the bit.ly error if the tweet was actually posted.
+						if (isset($bitlyError)) {
+							$this->error('There was an error in your bit.ly details or you are attempting to shorten a non-web-accessible URL. The tweet will be posted using the long page URL instead.');
+						}
+					} else {
+						if (is_array($tmhOAuth->response['response'])
+							&& isset($tmhOAuth->response['response']['error']) 
+							&& $tmhOAuth->response['response']['error'] != 'Status is a duplicate.') { // If it's a duplicate, silently ignore it
+							
+							$this->error("One or more of the Twitter configuration fields in the SocialTwitterUpdate module were empty");
+						}
+					}
+				}
+			}
+			$runOnce = true;
+		}
+	}
+	
+	private static function _createInputfieldText($tName, $tTitle, $tValue, $tDesc=''){
+		$field = wire('modules')->get("InputfieldText");
+		$field->name = $tName;
+		$field->label = $tTitle;
+		$field->description = $tDesc;
+		$field->attr('value', $tValue);
+		return $field;
+	}
+	
+	private static function _createInputfieldTextarea($tName, $tTitle, $tValue, $tDesc=''){
+		$field = wire('modules')->get("InputfieldTextarea");
+		$field->name = $tName;
+		$field->label = $tTitle;
+		$field->description = $tDesc;
+		$field->attr('value', $tValue);
+		return $field;
+	}
+	
+	// aPath = sections. "Sections" are classed as any visible page under the root, so the path defaults to /  The most common examples I would think we want to use 
+	// in this module are News and Blog
+	private static function _createInputfieldASMSelect($aName, $aTitle, $aValue, $aDesc='', $aPath='/') {
+		if(!isset($aValue) || !is_array($aValue)) $aValue = array(); 
+		$modules = Wire::getFuel('modules');
+		$field = $modules->get("InputfieldAsmSelect");
+		$field->attr('name', $aName);
+		$children = wire('pages')->get($aPath)->children; 
+		foreach($children as $child) {
+			$field->addOption($child->id, $child->title); 
+		}
+		$field->attr('value', $aValue); 
+		$field->label = $aTitle;
+		$field->description = $aDesc;
+		return $field;
+	}
+}
